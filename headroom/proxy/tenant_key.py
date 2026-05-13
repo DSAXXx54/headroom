@@ -20,7 +20,7 @@ namespace grows by one component.
 
 # Resolution rules
 
-The resolver picks the most-specific signal available, in this order:
+The resolver uses an explicit tenant signal only:
 
 1. **Header** — when ``HEADROOM_TENANT_KEY_HEADER`` (default
    ``X-Headroom-Tenant-ID``) is present and survives sanitization
@@ -28,22 +28,11 @@ The resolver picks the most-specific signal available, in this order:
    The customer's auth-proxy / sidecar is the canonical place to pin
    tenancy — it knows the tenant best.
 
-2. **Hash** — when no header is present but both an auth_mode (from
-   F1) and a bearer token are. The key is
-   ``BLAKE2b("{auth_mode}:{api_key}")[:24]``. Source: ``"hash"``.
-   BLAKE2b[:24] is the same digest-width idiom PR #395 uses in
-   ``headroom/cache/compression_store.py`` for content hashing — keeping
-   it consistent so operators only need to learn one truncation rule.
-   Hashing the full bearer token avoids collisions across real API keys
-   that intentionally share visible prefixes (for example provider key
-   prefixes) without logging or storing the secret itself.
-
-3. **Global** — the literal ``"global"`` namespace, used only when
-   neither a tenant-id header nor an auth bearer is present (the OSS
-   single-process / dev / unauthenticated case). Source: ``"global"``.
-   This is a real namespace, not a sentinel — the existing pool of
-   pre-F3 patterns already lives under ``"global"`` after the
-   migration, so a fresh deploy is non-breaking.
+2. **Global** — the literal ``"global"`` namespace when no tenant-id
+   header is present (the OSS single-process / dev / unauthenticated
+   case). Source: ``"global"``. This is a real namespace, not a sentinel
+   — the existing pool of pre-F3 patterns already lives under
+   ``"global"`` after the migration, so a fresh deploy is non-breaking.
 
 Every resolution emits a structured ``tenant_key_resolved`` log event
 (NOT silent — see ``feedback_no_silent_fallbacks.md``). Operators can
@@ -85,7 +74,6 @@ as the existing ``_request_ccr_store`` ContextVar in
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import unicodedata
@@ -102,7 +90,6 @@ logger = logging.getLogger(__name__)
 # load-bearing for tenant isolation.
 TENANT_KEY_HEADER_ENV_VAR: Final[str] = "HEADROOM_TENANT_KEY_HEADER"
 DEFAULT_TENANT_KEY_HEADER: Final[str] = "X-Headroom-Tenant-ID"
-TENANT_KEY_DIGEST_KEY_ENV_VAR: Final[str] = "HEADROOM_TENANT_KEY_DIGEST_KEY"
 
 # ── Tenant-key constants ──────────────────────────────────────────────
 # Maximum length we'll accept after sanitization. 64 chars is enough
@@ -112,19 +99,8 @@ TENANT_KEY_DIGEST_KEY_ENV_VAR: Final[str] = "HEADROOM_TENANT_KEY_DIGEST_KEY"
 # header by mistake.
 _MAX_TENANT_KEY_LEN: Final[int] = 64
 
-# Minimum bearer-token length used for the hash-mode key. Shorter
-# values are too low-entropy to be useful as a fallback tenant signal.
-_MIN_BEARER_TOKEN_LEN: Final[int] = 8
-
-# BLAKE2b[:24] truncation — same digest-width idiom as PR #395
-# (``compression_store.py`` line 241). Keeping the truncation length
-# consistent across the codebase so operators don't have to track two
-# different "how much of a hash do we keep" rules.
-_HASH_TRUNCATION_LEN: Final[int] = 24
-_DEFAULT_TENANT_DIGEST_KEY: Final[bytes] = b"headroom:tenant-key:v1"
-
-# Literal namespace name used when neither a tenant-id header nor a
-# bearer token is present. This is a real namespace, not a sentinel —
+# Literal namespace name used when no tenant-id header is present.
+# This is a real namespace, not a sentinel —
 # pre-F3 patterns already live under it after migration, and the OSS
 # single-tenant / unauthenticated dev case rightfully uses one shared
 # pool.
@@ -134,7 +110,6 @@ GLOBAL_TENANT_KEY: Final[str] = "global"
 # structured logs for ``source="global"`` to spot mis-configured
 # upstream auth proxies.
 SOURCE_HEADER: Final[str] = "header"
-SOURCE_HASH: Final[str] = "hash"
 SOURCE_GLOBAL: Final[str] = "global"
 
 
@@ -191,8 +166,7 @@ def resolve_tenant_key(request: Any) -> tuple[str, str]:
 
     1. ``HEADROOM_TENANT_KEY_HEADER`` (default ``X-Headroom-Tenant-ID``)
        header → ``"header"`` source.
-    2. BLAKE2b[:24] of ``f"{auth_mode}:{bearer_token}"`` → ``"hash"``.
-    3. Literal ``"global"`` namespace → ``"global"`` source.
+    2. Literal ``"global"`` namespace → ``"global"`` source.
 
     Every resolution emits a ``tenant_key_resolved`` structured log so
     operators can alert on a sustained ``source="global"`` rate.
@@ -204,8 +178,7 @@ def resolve_tenant_key(request: Any) -> tuple[str, str]:
 
     Returns:
         ``(tenant_key, source)`` — both non-empty strings. ``source`` is
-        one of :data:`SOURCE_HEADER`, :data:`SOURCE_HASH`,
-        :data:`SOURCE_GLOBAL`.
+        one of :data:`SOURCE_HEADER` or :data:`SOURCE_GLOBAL`.
     """
     # ── 1. Header path ────────────────────────────────────────────────
     header_name = os.environ.get(TENANT_KEY_HEADER_ENV_VAR, DEFAULT_TENANT_KEY_HEADER)
@@ -228,16 +201,8 @@ def resolve_tenant_key(request: Any) -> tuple[str, str]:
             },
         )
 
-    # ── 2. Hash path ──────────────────────────────────────────────────
-    auth_mode_str = _get_auth_mode_str(request)
-    bearer_token = _get_bearer_token(request)
-    if auth_mode_str and bearer_token:
-        digest = _tenant_key_digest(f"{auth_mode_str}:{bearer_token}")
-        tenant_key = digest[:_HASH_TRUNCATION_LEN]
-        _emit_resolution_log(tenant_key, SOURCE_HASH, auth_mode=auth_mode_str)
-        return tenant_key, SOURCE_HASH
+    # ── 2. Global fallback ───────────────────────────────────────────
 
-    # ── 3. Global fallback ────────────────────────────────────────────
     # MUST be logged (per `feedback_no_silent_fallbacks.md`). Operators
     # see a sustained ``source="global"`` rate as a config signal: the
     # proxy is sitting behind a path that doesn't carry tenant info.
@@ -298,38 +263,6 @@ def _get_auth_mode_str(request: Any) -> str:
     # name's value (``"payg"`` / ``"oauth"`` / ``"subscription"``) —
     # not the Python repr.
     return str(auth_mode)
-
-
-def _get_bearer_token(request: Any) -> str:
-    """Return the full bearer token from ``Authorization``.
-
-    Empty string if no ``Authorization: Bearer ...`` header is present
-    OR if the token is shorter than :data:`_MIN_BEARER_TOKEN_LEN` (in
-    which case we'd be hashing a low-entropy value, which gives a
-    useless tenant_key).
-    """
-    auth = _get_header(request, "authorization")
-    if not auth.startswith("Bearer "):
-        # Other auth schemes (AWS SigV4, Basic, ...) don't have a
-        # stable per-tenant prefix the way bearer tokens do. We could
-        # add SigV4 support later; for now we fall through to global.
-        return ""
-    token = auth[len("Bearer ") :]
-    if len(token) < _MIN_BEARER_TOKEN_LEN:
-        return ""
-    return token
-
-def _tenant_key_digest(message: str) -> str:
-    """Return a pseudonymous digest for hash-mode tenant identity.
-
-    The bearer token is sensitive, so never log or store it and avoid a
-    raw token digest. Keyed BLAKE2b keeps deterministic per-key partitioning for
-    TOIN while making the fallback tenant key deployment-scoped when
-    ``HEADROOM_TENANT_KEY_DIGEST_KEY`` is set.
-    """
-    raw_key = os.environ.get(TENANT_KEY_DIGEST_KEY_ENV_VAR)
-    key = raw_key.encode() if raw_key else _DEFAULT_TENANT_DIGEST_KEY
-    return hashlib.blake2b(message.encode(), key=key, digest_size=16).hexdigest()
 
 
 def _sanitize_tenant_key(raw: str) -> str:
@@ -409,8 +342,6 @@ def _emit_resolution_log(
 
     The ``tenant_key`` value itself is included in the structured
     fields. It's not a secret: header-mode keys are operator-supplied
-    identifiers and hash-mode keys are keyed BLAKE2b truncations of an
-    ``(auth_mode, bearer_token)`` pair (irreversible and pseudonymous).
     """
     extra: dict[str, Any] = {
         "event": "tenant_key_resolved",
@@ -431,10 +362,8 @@ __all__ = [
     "DEFAULT_TENANT_KEY_HEADER",
     "GLOBAL_TENANT_KEY",
     "SOURCE_GLOBAL",
-    "SOURCE_HASH",
     "SOURCE_HEADER",
     "TENANT_KEY_HEADER_ENV_VAR",
-    "TENANT_KEY_DIGEST_KEY_ENV_VAR",
     "get_current_tenant_key",
     "resolve_tenant_key",
     "set_request_tenant_key",

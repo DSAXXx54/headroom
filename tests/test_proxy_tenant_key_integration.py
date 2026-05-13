@@ -25,7 +25,6 @@ from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.tenant_key import (
     GLOBAL_TENANT_KEY,
     SOURCE_GLOBAL,
-    SOURCE_HASH,
     SOURCE_HEADER,
     get_current_tenant_key,
     set_request_tenant_key,
@@ -164,13 +163,13 @@ def test_handler_populates_request_state_tenant_key_for_header_path(monkeypatch)
     assert getattr(request.state, "tenant_key_source", None) == SOURCE_HEADER
 
 
-def test_handler_populates_request_state_tenant_key_for_hash_path(monkeypatch):
-    """No header but bearer + auth_mode ⇒ tenant_key is a SHA-256 hash."""
+def test_handler_populates_request_state_tenant_key_for_global_fallback(monkeypatch):
+    """No tenant header, even with bearer auth, ⇒ tenant_key is global."""
     handler = _DummyOpenAIHandler()
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
-    # PAYG bearer (sk-...). F1 will classify auth_mode=PAYG; F3 should
-    # then derive a hash-mode tenant_key.
+    # PAYG bearer (sk-...). F1 will classify auth_mode=PAYG, but F3
+    # requires an explicit tenant header instead of deriving from secrets.
     request = _build_request(
         headers={"Authorization": "Bearer sk-ant-api03-aaaabbbbccccdddd"},
         body={"model": "gpt-5.4", "input": "hi"},
@@ -178,12 +177,9 @@ def test_handler_populates_request_state_tenant_key_for_hash_path(monkeypatch):
 
     anyio.run(handler.handle_openai_responses, request)
 
-    assert getattr(request.state, "tenant_key_source", None) == SOURCE_HASH
+    assert getattr(request.state, "tenant_key_source", None) == SOURCE_GLOBAL
     tenant_key = getattr(request.state, "tenant_key", None)
-    assert tenant_key is not None
-    # SHA-256[:24] hex.
-    assert len(tenant_key) == 24
-    assert all(c in "0123456789abcdef" for c in tenant_key)
+    assert tenant_key == GLOBAL_TENANT_KEY
 
 
 def test_handler_populates_global_when_no_signals(monkeypatch):

@@ -1,7 +1,6 @@
 """Unit tests for ``headroom.proxy.tenant_key.resolve_tenant_key``.
 
-Phase F PR-F3 — covers the three resolution paths (header / hash /
-global), the structured-log requirement, and the sanitization edge
+Phase F PR-F3 — covers the two resolution paths (header / global), the structured-log requirement, and the sanitization edge
 cases (empty, too-long, unicode, control chars, hyphens, mixed
 ASCII).
 
@@ -11,7 +10,6 @@ the proxy handler tests; this file pins the pure resolver contract.
 
 from __future__ import annotations
 
-import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -20,10 +18,8 @@ from headroom.proxy.tenant_key import (
     DEFAULT_TENANT_KEY_HEADER,
     GLOBAL_TENANT_KEY,
     SOURCE_GLOBAL,
-    SOURCE_HASH,
     SOURCE_HEADER,
     TENANT_KEY_HEADER_ENV_VAR,
-    TENANT_KEY_DIGEST_KEY_ENV_VAR,
     get_current_tenant_key,
     resolve_tenant_key,
     set_request_tenant_key,
@@ -79,7 +75,7 @@ def test_header_path_default_name_is_x_headroom_tenant_id() -> None:
 def test_header_path_falls_through_when_empty_after_sanitization() -> None:
     """Pure-non-allowed header (e.g. all unicode) ⇒ fall through, NOT header source."""
     # All-emoji header sanitizes to empty string — neither header
-    # nor hash signal, so we drop to the global fallback.
+    # so we drop to the global fallback.
     req = _request(headers={"X-Headroom-Tenant-ID": "🦀🚀"})
     tenant_key, source = resolve_tenant_key(req)
     assert source == SOURCE_GLOBAL
@@ -89,87 +85,27 @@ def test_header_path_falls_through_when_empty_after_sanitization() -> None:
 # ── Hash path ─────────────────────────────────────────────────────────
 
 
-def test_hash_path_when_no_header_but_auth_mode_and_bearer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No header, but auth_mode + bearer ⇒ deterministic BLAKE2b[:24]."""
-    monkeypatch.setenv(TENANT_KEY_DIGEST_KEY_ENV_VAR, "test-tenant-digest-key")
-    token = "sk-ant-api03-abc123def456ghi789"
-    req = _request(
-        headers={"authorization": f"Bearer {token}"},
-        auth_mode="payg",
-    )
-    tenant_key, source = resolve_tenant_key(req)
-    assert source == SOURCE_HASH
-    expected = hashlib.blake2b(
-        f"payg:{token}".encode(),
-        key=b"test-tenant-digest-key",
-        digest_size=16,
-    ).hexdigest()[:24]
-    assert tenant_key == expected
-    assert len(tenant_key) == 24
 
-
-def test_hash_path_different_auth_modes_produce_different_keys() -> None:
-    """Same bearer-prefix under different auth modes ⇒ different keys."""
-    bearer = "Bearer same-tok-aaabbbccc"
-    payg = resolve_tenant_key(_request(headers={"authorization": bearer}, auth_mode="payg"))[0]
-    oauth = resolve_tenant_key(_request(headers={"authorization": bearer}, auth_mode="oauth"))[0]
-    assert payg != oauth
-
-
-def test_hash_path_full_bearer_token_prevents_prefix_collision() -> None:
-    """Hash uses the full bearer token, not only the provider prefix."""
-    req1 = _request(
-        headers={"authorization": "Bearer sk-ant-api03-aaa"},
-        auth_mode="payg",
-    )
-    req2 = _request(
-        headers={"authorization": "Bearer sk-ant-api03-bbb"},  # tail differs
-        auth_mode="payg",
-    )
-    assert resolve_tenant_key(req1)[0] != resolve_tenant_key(req2)[0]
-
-def test_hash_path_same_inputs_produce_same_key() -> None:
-    """Hash is stable: same auth_mode + same bearer token ⇒ same key."""
-    bearer = "Bearer sk-ant-api03-aaa"
-    req1 = _request(headers={"authorization": bearer}, auth_mode="payg")
-    req2 = _request(headers={"authorization": bearer}, auth_mode="payg")
-    assert resolve_tenant_key(req1)[0] == resolve_tenant_key(req2)[0]
-
-
-def test_hash_path_skipped_when_bearer_too_short() -> None:
-    """Bearer < 8 chars ⇒ no hash, fall through to global."""
-    req = _request(
-        headers={"authorization": "Bearer short"},  # 5 chars after Bearer
-        auth_mode="payg",
-    )
-    _, source = resolve_tenant_key(req)
-    assert source == SOURCE_GLOBAL
-
-
-def test_hash_path_skipped_when_no_auth_mode() -> None:
-    """Bearer present but auth_mode unset ⇒ fall through to global."""
+def test_bearer_without_header_uses_global_namespace() -> None:
     req = _request(
         headers={"authorization": "Bearer sk-ant-api03-abc123def"},
-        auth_mode=None,
+        auth_mode="payg",
     )
-    _, source = resolve_tenant_key(req)
+
+    tenant_key, source = resolve_tenant_key(req)
+
+    assert tenant_key == GLOBAL_TENANT_KEY
     assert source == SOURCE_GLOBAL
 
 
-def test_hash_path_skipped_for_non_bearer_auth() -> None:
-    """AWS SigV4 / Basic ⇒ no bearer, fall through to global."""
-    req = _request(
-        headers={"authorization": "AWS4-HMAC-SHA256 Credential=AKIA..."},
-        auth_mode="oauth",
-    )
-    _, source = resolve_tenant_key(req)
-    assert source == SOURCE_GLOBAL
+def test_auth_mode_without_header_does_not_partition_tenants() -> None:
+    bearer = "Bearer same-tok-aaabbbccc"
 
+    payg = resolve_tenant_key(_request(headers={"authorization": bearer}, auth_mode="payg"))
+    oauth = resolve_tenant_key(_request(headers={"authorization": bearer}, auth_mode="oauth"))
 
-# ── Global fallback ───────────────────────────────────────────────────
-
+    assert payg == (GLOBAL_TENANT_KEY, SOURCE_GLOBAL)
+    assert oauth == (GLOBAL_TENANT_KEY, SOURCE_GLOBAL)
 
 def test_global_fallback_when_no_signals() -> None:
     """No header, no auth, no key ⇒ literal ``"global"``."""
@@ -209,8 +145,8 @@ def test_header_source_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> 
     assert matching[0].source == "header"  # type: ignore[attr-defined]
 
 
-def test_hash_source_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hash path also emits the structured log."""
+def test_bearer_without_header_emits_global_structured_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bearer auth without a tenant header still emits the global log."""
     req = _request(
         headers={"authorization": "Bearer sk-ant-api03-abc123def"},
         auth_mode="payg",
@@ -218,7 +154,7 @@ def test_hash_source_emits_structured_log(monkeypatch: pytest.MonkeyPatch) -> No
     matching = _capture_tenant_resolution_logs(monkeypatch)
     resolve_tenant_key(req)
     assert len(matching) == 1
-    assert matching[0].source == "hash"  # type: ignore[attr-defined]
+    assert matching[0].source == "global"  # type: ignore[attr-defined]
 
 
 # ── Sanitization edges ────────────────────────────────────────────────
@@ -327,11 +263,11 @@ def test_set_request_tenant_key_none_resets_to_global() -> None:
     assert get_current_tenant_key() == GLOBAL_TENANT_KEY
 
 
-# ── Header precedence over hash ───────────────────────────────────────
+# ── Header precedence over auth headers ───────────────────────────────
 
 
-def test_header_takes_precedence_over_hash() -> None:
-    """When both a header and an auth bearer are present, header wins."""
+def test_header_takes_precedence_over_auth_header() -> None:
+    """When both a tenant header and bearer auth are present, the tenant header wins."""
     req = _request(
         headers={
             "X-Headroom-Tenant-ID": "cust_explicit",
