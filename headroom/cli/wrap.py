@@ -2439,6 +2439,13 @@ def copilot(
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
         headroom wrap copilot --subscription -- --model gpt-4.1
         headroom wrap copilot --no-context-tool -- --prompt "explain this file"
+
+    \b
+    Copilot hosted API (--subscription and the implicit OAuth path) routes to the
+    generic host https://api.githubcopilot.com, which serves the full model set.
+    Enterprise / data-residency accounts provisioned on a dedicated host pin it
+    explicitly with GITHUB_COPILOT_API_URL (the override flows through to upstream).
+    See TESTING-copilot-subscription.md for details.
     """
     copilot_bin = shutil.which("copilot")
     if not copilot_bin:
