@@ -2133,13 +2133,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _upstream_check_cache["error"] = str(exc)
             _upstream_check_cache["expires_at"] = time.monotonic() + _UPSTREAM_CHECK_TTL
 
-    # CORS
+    # CORS: scoped to localhost by default. The old wildcard origin combined
+    # with allow_credentials=True let any web page the user had open read the
+    # proxy's content endpoints (e.g. /v1/retrieve returns raw, uncompressed
+    # tool outputs) via a cross-origin fetch to 127.0.0.1 (CWE-346).
+    #
+    # The default matches any loopback origin on any port via a regex, so it
+    # works regardless of the --port the proxy was started on without the app
+    # needing to know its own bound port (the port lives in the CLI/uvicorn
+    # layer, not in ProxyConfig). Set HEADROOM_CORS_ORIGINS (comma-separated)
+    # to pin an explicit allowlist for Docker or remote-dashboard deployments;
+    # "*" restores the old wildcard behaviour if the operator accepts the risk.
+    _default_loopback_origin_regex = r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
+    _cors_origins_env = os.environ.get("HEADROOM_CORS_ORIGINS", "").strip()
+    if _cors_origins_env:
+        _cors_allow_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+        _cors_allow_origin_regex: str | None = None
+    else:
+        _cors_allow_origins = []
+        _cors_allow_origin_regex = _default_loopback_origin_regex
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_cors_allow_origins,
+        allow_origin_regex=_cors_allow_origin_regex,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     # X-Headroom-Stack: SDK adapters (TS openai/anthropic/etc.) tag their
